@@ -1,5 +1,7 @@
 # Hanzo Graph
 
+[![Open in Hanzo](https://hanzo.app/badges/open-in-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/graph&ref=main&action=open) [![Edit with Hanzo](https://hanzo.app/badges/edit-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/graph&ref=main&action=edit) [![Deploy with Hanzo](https://hanzo.app/badges/deploy-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/graph&ref=main&action=deploy)
+
 Hanzo Graph forks Dgraph (`github.com/dgraph-io/dgraph`, Apache License 2.0) at commit 64804bd2 and
 cuts it down to what runs inside a single process. It keeps the posting-list engine, the schema and
 index layers, the tokenizers, the type system, the DQL parser, the UID set algebra, and the wire
