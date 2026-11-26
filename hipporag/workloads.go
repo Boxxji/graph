@@ -6,6 +6,8 @@ package hipporag
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -1068,6 +1070,16 @@ func convertHotpotQA(name string, items []hotpotQAItem) WorkloadBundle {
 	return WorkloadBundle{Name: "external:" + name, Records: recs, Queries: qs}
 }
 
+func musiquePassageSourceID(title, text string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d:%s\x00%d:%s", len(title), title, len(text), text)
+	digest := hex.EncodeToString(h.Sum(nil))[:24]
+	if normTitle := NormalizeEntity(title); normTitle != "" {
+		return fmt.Sprintf("ext_mq_%s_%s", normTitle, digest)
+	}
+	return "ext_mq_" + digest
+}
+
 func convertMuSiQue(name string, items []musiqueItem) WorkloadBundle {
 	seenDoc := make(map[string]bool)
 	var recs []SourceRecord
@@ -1075,8 +1087,9 @@ func convertMuSiQue(name string, items []musiqueItem) WorkloadBundle {
 
 	for idx, it := range items {
 		var goldIDs []string
+		seenGold := make(map[string]bool)
 		for _, p := range it.Paragraphs {
-			sid := fmt.Sprintf("ext_mq_%s_%d", NormalizeEntity(p.Title), p.Idx)
+			sid := musiquePassageSourceID(p.Title, p.ParagraphText)
 			if !seenDoc[sid] {
 				seenDoc[sid] = true
 				recs = append(recs, SourceRecord{
@@ -1090,7 +1103,8 @@ func convertMuSiQue(name string, items []musiqueItem) WorkloadBundle {
 					Reliability: 0.92,
 				})
 			}
-			if p.IsSupporting {
+			if p.IsSupporting && !seenGold[sid] {
+				seenGold[sid] = true
 				goldIDs = append(goldIDs, sid)
 			}
 		}

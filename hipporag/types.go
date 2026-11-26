@@ -13,7 +13,8 @@ var (
 	ErrEmptySourceID = errors.New("hipporag: source ID is required")
 	// ErrInvalidVersion is returned when a canonical source record has Version == 0.
 	ErrInvalidVersion = errors.New("hipporag: source version must be >= 1")
-	// ErrIndexesNotBuilt is returned when querying after DropDerivedIndexes before RebuildIndex.
+	// ErrIndexesNotBuilt is returned when querying before derived indexes are built,
+	// after DropDerivedIndexes, or after UpsertSource mutates canonical state before RebuildIndex.
 	ErrIndexesNotBuilt = errors.New("hipporag: derived indexes are dropped; call RebuildIndex")
 )
 
@@ -56,17 +57,19 @@ type SourceRecord struct {
 // Clone returns a deep copy of the canonical source record.
 func (r SourceRecord) Clone() SourceRecord {
 	cp := r
-	if len(r.ACL) > 0 {
-		cp.ACL = append([]string(nil), r.ACL...)
+	if r.ACL != nil {
+		cp.ACL = make([]string, len(r.ACL))
+		copy(cp.ACL, r.ACL)
 	}
-	if len(r.Metadata) > 0 {
+	if r.Metadata != nil {
 		cp.Metadata = make(map[string]string, len(r.Metadata))
 		for k, v := range r.Metadata {
 			cp.Metadata[k] = v
 		}
 	}
-	if len(r.Triples) > 0 {
-		cp.Triples = append([]ExtractedTriple(nil), r.Triples...)
+	if r.Triples != nil {
+		cp.Triples = make([]ExtractedTriple, len(r.Triples))
+		copy(cp.Triples, r.Triples)
 	}
 	return cp
 }

@@ -104,6 +104,8 @@ func (e *Engine) UpsertSource(rec SourceRecord) error {
 	e.history[cp.TenantID][cp.SourceID] = append(e.history[cp.TenantID][cp.SourceID], cp)
 	if existing, exists := e.canonical[cp.TenantID][cp.SourceID]; !exists || cp.Version >= existing.Version {
 		e.canonical[cp.TenantID][cp.SourceID] = cp
+		e.derivedBuilt = false
+		e.tenants = make(map[string]*tenantIndex)
 	}
 	return nil
 }

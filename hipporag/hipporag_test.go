@@ -437,3 +437,256 @@ func TestEndToEndBenchmarkReportAndInvariants(t *testing.T) {
 		t.Fatalf("RenderReportREADME missing MIT license audit")
 	}
 }
+
+func TestUpsertInvalidatesDerivedIndexesOnACLRevocation(t *testing.T) {
+	eng := NewEngine(DefaultPPRConfig())
+	pubCtx := AccessContext{TenantID: "tenant-alpha", Scopes: []string{"team:public"}}
+	privCtx := AccessContext{TenantID: "tenant-alpha", Scopes: []string{"sec:restricted"}}
+
+	v1 := SourceRecord{
+		SourceID:    "doc_secret_transition",
+		Version:     1,
+		Kind:        SourceDocument,
+		TenantID:    "tenant-alpha",
+		Title:       "Kernel Guard Spec",
+		Text:        "Public draft describing stream_capture_guard token alpha_sentinel_v1.",
+		Reliability: 0.95,
+	}
+	if err := eng.UpsertSourcesAndRebuild([]SourceRecord{v1}); err != nil {
+		t.Fatalf("UpsertSourcesAndRebuild v1: %v", err)
+	}
+	if !eng.HasDerivedIndexes() {
+		t.Fatalf("expected HasDerivedIndexes() == true after initial build")
+	}
+
+	reqPub := QueryRequest{
+		Query:  "stream_capture_guard alpha_sentinel_v1",
+		Access: pubCtx,
+		TopK:   5,
+	}
+	if res, err := eng.SearchHippoRAG2(reqPub); err != nil || len(res.Hits) == 0 {
+		t.Fatalf("expected v1 hit before revocation, got err=%v hits=%d", err, len(res.Hits))
+	}
+
+	// Revoke public access by upserting a restricted v2 WITHOUT calling RebuildIndex yet.
+	v2 := SourceRecord{
+		SourceID:    "doc_secret_transition",
+		Version:     2,
+		Kind:        SourceDocument,
+		TenantID:    "tenant-alpha",
+		ACL:         []string{"sec:restricted"},
+		Title:       "Kernel Guard Spec",
+		Text:        "Restricted revision describing stream_capture_guard token alpha_sentinel_v2.",
+		Reliability: 0.98,
+	}
+	if err := eng.UpsertSource(v2); err != nil {
+		t.Fatalf("UpsertSource v2: %v", err)
+	}
+	if eng.HasDerivedIndexes() {
+		t.Fatalf("expected UpsertSource changing canonical record to invalidate derived indexes")
+	}
+	if _, ok := eng.GetSource(pubCtx, v1.SourceID); ok {
+		t.Fatalf("expected GetSource to deny revoked public caller immediately")
+	}
+	if rec, ok := eng.GetSource(privCtx, v1.SourceID); !ok || rec.Version != 2 {
+		t.Fatalf("expected privileged caller to see v2 via GetSource, got ok=%v version=%d", ok, rec.Version)
+	}
+
+	// All four search methods must reject queries until RebuildIndex runs so stale ACL/text cannot leak.
+	searchers := []struct {
+		name string
+		fn   func(QueryRequest) (QueryResult, error)
+	}{
+		{"hipporag2", eng.SearchHippoRAG2},
+		{"bm25", eng.SearchBM25},
+		{"dense", eng.SearchDenseRAG},
+		{"1hop", eng.SearchUnfiltered1Hop},
+	}
+	for _, s := range searchers {
+		if _, err := s.fn(reqPub); err != ErrIndexesNotBuilt {
+			t.Fatalf("%s: expected ErrIndexesNotBuilt after canonical ACL revocation before rebuild, got %v", s.name, err)
+		}
+	}
+
+	// Rebuild and verify public caller sees zero hits while privileged caller sees v2.
+	eng.RebuildIndex()
+	if !eng.HasDerivedIndexes() {
+		t.Fatalf("expected HasDerivedIndexes() == true after RebuildIndex")
+	}
+	reqPriv := QueryRequest{
+		Query:  "stream_capture_guard alpha_sentinel_v2",
+		Access: privCtx,
+		TopK:   5,
+	}
+	for _, s := range searchers {
+		pubRes, err := s.fn(reqPub)
+		if err != nil {
+			t.Fatalf("%s public query after rebuild: %v", s.name, err)
+		}
+		if len(pubRes.Hits) != 0 {
+			t.Fatalf("%s leaked revoked source to public caller after rebuild: %+v", s.name, pubRes.Hits)
+		}
+		privRes, err := s.fn(reqPriv)
+		if err != nil {
+			t.Fatalf("%s privileged query after rebuild: %v", s.name, err)
+		}
+		if len(privRes.Hits) != 1 || privRes.Hits[0].Version != 2 {
+			t.Fatalf("%s expected privileged v2 hit after rebuild, got %+v", s.name, privRes.Hits)
+		}
+	}
+
+	// Backfilling an older version (< canonical Version 2) records history without mutating canonical or dirtying indexes.
+	if err := eng.UpsertSource(v1); err != nil {
+		t.Fatalf("backfill v1: %v", err)
+	}
+	if !eng.HasDerivedIndexes() {
+		t.Fatalf("older version backfill should not invalidate derived indexes when canonical record did not change")
+	}
+	if got := eng.SourceVersionCount("tenant-alpha", v1.SourceID); got != 3 {
+		t.Fatalf("expected 3 history versions, got %d", got)
+	}
+}
+
+func TestMuSiQueDuplicateTitleAndIdxCollisionSafety(t *testing.T) {
+	tmpDir := t.TempDir()
+	mqPath := filepath.Join(tmpDir, "musique_collisions.jsonl")
+
+	// Example 1 and Example 2 share the exact same article title ("Apollo Program") and local idx (0)
+	// but contain different paragraph text. Example 3 repeats Example 1's exact (title, text) at idx 5.
+	lines := []string{
+		`{"id":"mq_dup_1","question":"Where did Apollo 11 land?","answer":"Tranquility Base","paragraphs":[{"idx":0,"title":"Apollo Program","paragraph_text":"Apollo 11 landed at Tranquility Base in July 1969.","is_supporting":true}]}`,
+		`{"id":"mq_dup_2","question":"Which valley did Apollo 17 explore?","answer":"Taurus-Littrow Valley","paragraphs":[{"idx":0,"title":"Apollo Program","paragraph_text":"Apollo 17 explored Taurus-Littrow Valley in December 1972.","is_supporting":true}]}`,
+		`{"id":"mq_dup_3","question":"When did Apollo 11 land at Tranquility Base?","answer":"July 1969","paragraphs":[{"idx":5,"title":"Apollo Program","paragraph_text":"Apollo 11 landed at Tranquility Base in July 1969.","is_supporting":true}]}`,
+	}
+	if err := os.WriteFile(mqPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write musique collision fixture: %v", err)
+	}
+
+	bundle, err := LoadExternalDataset(mqPath)
+	if err != nil {
+		t.Fatalf("LoadExternalDataset: %v", err)
+	}
+	if len(bundle.Records) != 2 {
+		t.Fatalf("expected 2 distinct records (distinct texts kept, identical text deduplicated), got %d: %+v", len(bundle.Records), bundle.Records)
+	}
+	if len(bundle.Queries) != 3 {
+		t.Fatalf("expected 3 queries, got %d", len(bundle.Queries))
+	}
+
+	gold1 := bundle.Queries[0].GoldSourceIDs
+	gold2 := bundle.Queries[1].GoldSourceIDs
+	gold3 := bundle.Queries[2].GoldSourceIDs
+	if len(gold1) != 1 || len(gold2) != 1 || len(gold3) != 1 {
+		t.Fatalf("unexpected gold ID counts: q1=%v q2=%v q3=%v", gold1, gold2, gold3)
+	}
+	if gold1[0] == gold2[0] {
+		t.Fatalf("distinct MuSiQue paragraphs with same (title, idx) collided on SourceID %q", gold1[0])
+	}
+	if gold1[0] != gold3[0] {
+		t.Fatalf("identical MuSiQue (title, text) passages should share SourceID: got %q vs %q", gold1[0], gold3[0])
+	}
+
+	recByID := make(map[string]SourceRecord, len(bundle.Records))
+	for _, r := range bundle.Records {
+		recByID[r.SourceID] = r
+	}
+	if !strings.Contains(recByID[gold1[0]].Text, "Tranquility Base") {
+		t.Fatalf("q1 gold record %q has wrong text: %q", gold1[0], recByID[gold1[0]].Text)
+	}
+	if !strings.Contains(recByID[gold2[0]].Text, "Taurus-Littrow Valley") {
+		t.Fatalf("q2 gold record %q has wrong text: %q", gold2[0], recByID[gold2[0]].Text)
+	}
+
+	// Verify the second distinct paragraph is genuinely indexed and retrieved by the engine.
+	eng := NewEngine(DefaultPPRConfig())
+	if err := eng.UpsertSourcesAndRebuild(bundle.Records); err != nil {
+		t.Fatalf("UpsertSourcesAndRebuild: %v", err)
+	}
+	res, err := eng.SearchHippoRAG2(QueryRequest{
+		Query:  "Taurus-Littrow Valley Apollo 17",
+		Access: AccessContext{TenantID: defaultTenant},
+		TopK:   2,
+	})
+	if err != nil {
+		t.Fatalf("SearchHippoRAG2: %v", err)
+	}
+	if len(res.Hits) == 0 || res.Hits[0].SourceID != gold2[0] {
+		t.Fatalf("expected top hit to be second Apollo paragraph %q, got %+v", gold2[0], res.Hits)
+	}
+}
+
+func TestCloneDeepCopiesEmptyNonNilMetadataMap(t *testing.T) {
+	eng := NewEngine(DefaultPPRConfig())
+	ctx := AccessContext{TenantID: "tenant-meta"}
+
+	callerMeta := map[string]string{}
+	src := SourceRecord{
+		SourceID:    "doc_empty_meta",
+		Version:     1,
+		Kind:        SourceDocument,
+		TenantID:    "tenant-meta",
+		Title:       "Isolated Source",
+		Text:        "Canonical text with an initially empty non-nil metadata map.",
+		Reliability: 0.90,
+		ACL:         make([]string, 0, 4),
+		Metadata:    callerMeta,
+		Triples:     make([]ExtractedTriple, 0, 2),
+	}
+	target := SourceRecord{
+		SourceID:    "doc_target",
+		Version:     1,
+		Kind:        SourceDocument,
+		TenantID:    "tenant-meta",
+		Title:       "Target Source",
+		Text:        "Unlinked target document.",
+		Reliability: 0.90,
+	}
+	if err := eng.UpsertSourcesAndRebuild([]SourceRecord{src, target}); err != nil {
+		t.Fatalf("UpsertSourcesAndRebuild: %v", err)
+	}
+	snapBefore := eng.Snapshot()
+
+	// Mutate caller's empty metadata map after UpsertSource and mutate the map returned by GetSource.
+	callerMeta["links_to"] = "doc_target"
+	callerMeta["caller_mut"] = "should_not_leak"
+
+	got, ok := eng.GetSource(ctx, "doc_empty_meta")
+	if !ok {
+		t.Fatalf("GetSource failed for doc_empty_meta")
+	}
+	if got.Metadata == nil {
+		t.Fatalf("expected non-nil cloned Metadata map from GetSource")
+	}
+	got.Metadata["links_to"] = "doc_target"
+	got.Metadata["get_mut"] = "should_not_leak"
+
+	// Concurrently mutate caller and GetSource maps while rebuilding to verify zero data races under -race.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			callerMeta["links_to"] = "doc_target"
+			got.Metadata["links_to"] = "doc_target"
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			eng.RebuildIndex()
+		}
+	}()
+	wg.Wait()
+
+	fresh, ok := eng.GetSource(ctx, "doc_empty_meta")
+	if !ok {
+		t.Fatalf("GetSource after rebuild failed")
+	}
+	if fresh.Metadata == nil || len(fresh.Metadata) != 0 {
+		t.Fatalf("canonical Metadata was mutated externally: got %#v", fresh.Metadata)
+	}
+	snapAfter := eng.Snapshot()
+	if snapBefore.DigestSHA256 != snapAfter.DigestSHA256 || snapBefore.GraphEdges != snapAfter.GraphEdges {
+		t.Fatalf("external empty-map mutation altered derived graph: before=%+v after=%+v", snapBefore, snapAfter)
+	}
+}
