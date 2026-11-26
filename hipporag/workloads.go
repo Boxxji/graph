@@ -954,7 +954,10 @@ func LoadExternalDataset(path string) (WorkloadBundle, error) {
 	}
 
 	// Format 1: Native WorkloadBundle JSON object with "records" and "queries".
-	if strings.HasPrefix(trimmed, "{") && !strings.Contains(trimmed, "\n{") {
+	// Attempt whole-document native decoding before falling back to JSONL so
+	// formatting/indentation (e.g., json.MarshalIndent(bundle, "", "")) does not
+	// misclassify a native bundle as JSONL.
+	if strings.HasPrefix(trimmed, "{") {
 		var native WorkloadBundle
 		if err := json.Unmarshal(raw, &native); err == nil && len(native.Records) > 0 && len(native.Queries) > 0 {
 			if native.Name == "" {
@@ -997,6 +1000,16 @@ func LoadExternalDataset(path string) (WorkloadBundle, error) {
 	return convertMuSiQue(filepath.Base(path), mItems), nil
 }
 
+func hotpotArticleSourceID(title, text string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d:%s\x00%d:%s", len(title), title, len(text), text)
+	digest := hex.EncodeToString(h.Sum(nil))[:24]
+	if normTitle := NormalizeEntity(title); normTitle != "" {
+		return fmt.Sprintf("ext_hp_%s_%s", normTitle, digest)
+	}
+	return "ext_hp_" + digest
+}
+
 func convertHotpotQA(name string, items []hotpotQAItem) WorkloadBundle {
 	seenDoc := make(map[string]bool)
 	var recs []SourceRecord
@@ -1013,6 +1026,7 @@ func convertHotpotQA(name string, items []hotpotQAItem) WorkloadBundle {
 		}
 
 		var goldIDs []string
+		seenGold := make(map[string]bool)
 		for _, ctxEntry := range it.Context {
 			if len(ctxEntry) < 2 {
 				continue
@@ -1031,10 +1045,8 @@ func convertHotpotQA(name string, items []hotpotQAItem) WorkloadBundle {
 					parts = append(parts, s)
 				}
 			}
-			sid := "ext_hp_" + NormalizeEntity(title)
-			if sid == "ext_hp_" {
-				sid = fmt.Sprintf("ext_hp_%d", idx)
-			}
+			text := strings.Join(parts, " ")
+			sid := hotpotArticleSourceID(title, text)
 			if !seenDoc[sid] {
 				seenDoc[sid] = true
 				recs = append(recs, SourceRecord{
@@ -1043,12 +1055,13 @@ func convertHotpotQA(name string, items []hotpotQAItem) WorkloadBundle {
 					Kind:        SourceDocument,
 					TenantID:    defaultTenant,
 					Title:       title,
-					Text:        strings.Join(parts, " "),
+					Text:        text,
 					Timestamp:   int64(1736000000 + len(recs)),
 					Reliability: 0.92,
 				})
 			}
-			if suppTitles[title] {
+			if suppTitles[title] && !seenGold[sid] {
+				seenGold[sid] = true
 				goldIDs = append(goldIDs, sid)
 			}
 		}

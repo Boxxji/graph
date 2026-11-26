@@ -5,6 +5,7 @@
 package hipporag
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -688,5 +689,127 @@ func TestCloneDeepCopiesEmptyNonNilMetadataMap(t *testing.T) {
 	snapAfter := eng.Snapshot()
 	if snapBefore.DigestSHA256 != snapAfter.DigestSHA256 || snapBefore.GraphEdges != snapAfter.GraphEdges {
 		t.Fatalf("external empty-map mutation altered derived graph: before=%+v after=%+v", snapBefore, snapAfter)
+	}
+}
+
+func TestHotpotQANormalizationCollisionSafety(t *testing.T) {
+	tmpDir := t.TempDir()
+	hpPath := filepath.Join(tmpDir, "hotpot_collisions.json")
+
+	// "C" and "C++" both normalize via NormalizeEntity to "c".
+	// Both articles must receive distinct collision-safe SourceIDs and distinct GoldSourceIDs,
+	// while a repeated identical (title, text) article deduplicates to the same SourceID.
+	payload := `[
+  {
+    "_id": "hp_c_1",
+    "question": "Who created the C programming language?",
+    "answer": "Dennis Ritchie",
+    "supporting_facts": [["C", 0]],
+    "context": [["C", ["C was created by Dennis Ritchie at Bell Labs."]]]
+  },
+  {
+    "_id": "hp_cpp_2",
+    "question": "Who created C++?",
+    "answer": "Bjarne Stroustrup",
+    "supporting_facts": [["C++", 0]],
+    "context": [["C++", ["C++ was created by Bjarne Stroustrup at Bell Labs."]]]
+  },
+  {
+    "_id": "hp_c_repeat",
+    "question": "Where was C created?",
+    "answer": "Bell Labs",
+    "supporting_facts": [["C", 0]],
+    "context": [["C", ["C was created by Dennis Ritchie at Bell Labs."]]]
+  }
+]`
+	if err := os.WriteFile(hpPath, []byte(payload), 0o644); err != nil {
+		t.Fatalf("write hotpot collision fixture: %v", err)
+	}
+
+	bundle, err := LoadExternalDataset(hpPath)
+	if err != nil {
+		t.Fatalf("LoadExternalDataset HotpotQA: %v", err)
+	}
+	if len(bundle.Records) != 2 {
+		t.Fatalf("expected 2 distinct HotpotQA records for C and C++, got %d: %+v", len(bundle.Records), bundle.Records)
+	}
+	if len(bundle.Queries) != 3 {
+		t.Fatalf("expected 3 queries, got %d", len(bundle.Queries))
+	}
+
+	goldC := bundle.Queries[0].GoldSourceIDs
+	goldCpp := bundle.Queries[1].GoldSourceIDs
+	goldCRepeat := bundle.Queries[2].GoldSourceIDs
+	if len(goldC) != 1 || len(goldCpp) != 1 || len(goldCRepeat) != 1 {
+		t.Fatalf("unexpected gold ID counts: c=%v cpp=%v repeat=%v", goldC, goldCpp, goldCRepeat)
+	}
+	if goldC[0] == goldCpp[0] {
+		t.Fatalf("distinct HotpotQA titles 'C' and 'C++' collided on SourceID %q", goldC[0])
+	}
+	if goldC[0] != goldCRepeat[0] {
+		t.Fatalf("identical HotpotQA (title, text) articles should share SourceID: got %q vs %q", goldC[0], goldCRepeat[0])
+	}
+
+	recByID := make(map[string]SourceRecord, len(bundle.Records))
+	for _, r := range bundle.Records {
+		recByID[r.SourceID] = r
+	}
+	if recByID[goldC[0]].Title != "C" || !strings.Contains(recByID[goldC[0]].Text, "Dennis Ritchie") {
+		t.Fatalf("unexpected C record: %+v", recByID[goldC[0]])
+	}
+	if recByID[goldCpp[0]].Title != "C++" || !strings.Contains(recByID[goldCpp[0]].Text, "Bjarne Stroustrup") {
+		t.Fatalf("unexpected C++ record: %+v", recByID[goldCpp[0]])
+	}
+}
+
+func TestLoadExternalDatasetNativeBundleZeroIndent(t *testing.T) {
+	tmpDir := t.TempDir()
+	nativePath := filepath.Join(tmpDir, "native_zero_indent.json")
+
+	want := WorkloadBundle{
+		Name: "native_zero_indent",
+		Records: []SourceRecord{
+			{
+				SourceID:    "doc_1",
+				Version:     1,
+				Kind:        SourceDocument,
+				TenantID:    defaultTenant,
+				Title:       "Zero Indent Record",
+				Text:        "Native workload bundle formatted with zero-indent JSON.",
+				Reliability: 0.95,
+			},
+		},
+		Queries: []BenchmarkQuery{
+			{
+				ID:            "q_1",
+				Category:      "single_hop_fact",
+				Query:         "What is formatted with zero-indent JSON?",
+				Access:        AccessContext{TenantID: defaultTenant},
+				GoldSourceIDs: []string{"doc_1"},
+			},
+		},
+	}
+
+	// json.MarshalIndent(..., "", "") places nested object braces on column zero ("\n{").
+	raw, err := json.MarshalIndent(want, "", "")
+	if err != nil {
+		t.Fatalf("json.MarshalIndent: %v", err)
+	}
+	if !strings.Contains(string(raw), "\n{") {
+		t.Fatalf("expected zero-indent JSON to contain '\\n{' for regression coverage")
+	}
+	if err := os.WriteFile(nativePath, raw, 0o644); err != nil {
+		t.Fatalf("write native zero-indent fixture: %v", err)
+	}
+
+	got, err := LoadExternalDataset(nativePath)
+	if err != nil {
+		t.Fatalf("LoadExternalDataset zero-indent native bundle failed: %v", err)
+	}
+	if got.Name != want.Name || len(got.Records) != 1 || len(got.Queries) != 1 {
+		t.Fatalf("unexpected decoded native bundle: %+v", got)
+	}
+	if got.Records[0].SourceID != "doc_1" || got.Queries[0].ID != "q_1" {
+		t.Fatalf("mismatched decoded native bundle contents: %+v", got)
 	}
 }
